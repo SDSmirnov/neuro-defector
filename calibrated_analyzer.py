@@ -49,6 +49,22 @@
 
   Установка:
     pip install sentence-transformers numpy
+
+Свой список клише (опционально):
+
+  python calibrated_analyzer.py calibrate corpora/human corpora/ai \\
+      --cliches my_cliches.json
+  python calibrated_analyzer.py analyze AK.txt --cliches my_cliches.json
+
+  Формат JSON: {"bad_style_examples": ["взгляд стал ледяным", "вдруг", ...]}
+  или просто список строк на верхнем уровне.
+
+  Одиночные слова в списке («вдруг», «казалось») идут в lexical_marker_rate
+  как частотный признак.  Многословные фразы — в семантический индекс
+  и сравниваются с предложениями текста по косинусу.
+
+  Список сохраняется в calibration.json — analyze автоматически
+  применит ту же разметку, если --cliches не задан повторно.
 """
 
 import sys
@@ -218,10 +234,17 @@ def feature_punct_entropy(text: str) -> float:
 
 # ─────────────────────── семантические клише ───────────────────────
 
-# Встроенный список типичных ИИ-конструкций для русской прозы.
-# Каждое выражение берётся как самостоятельная мысль; эмбеддятся один
-# раз при первом анализе и сравниваются по косинусу с предложениями
-# текста.  Список можно расширять — это обычные строки, не регулярки.
+# Список ИИ-маркеров делится на две категории:
+#
+#   1) Лексические маркеры — одиночные слова («вдруг», «казалось»,
+#      «безусловно»). Они НЕ годятся для семантического сравнения
+#      (вектор одного слова слишком общий и даст ложные срабатывания);
+#      их ловим частотным счётчиком — высокая плотность таких слов
+#      сама по себе диагностический сигнал.
+#
+#   2) Семантические клише — фразы из 2+ слов («в горле пересохло»,
+#      «взгляд стал ледяным»). Эмбеддятся, сравниваются с предложениями
+#      текста по косинусу.
 #
 # Порог CLICHE_SIM_HIT — выше него считаем, что предложение
 # семантически рифмуется с клише.  Подобран эмпирически для
@@ -229,61 +252,171 @@ def feature_punct_entropy(text: str) -> float:
 # потребоваться корректировка.
 CLICHE_SIM_HIT = 0.62
 
-CLICHE_PHRASES = [
-    # эмоциональные штампы
+# Высокая плотность слов-маркеров считается диагностическим сигналом.
+# Например, 3 «вдруг» на 200 слов = 1.5% — это уже подозрительно много.
+LEXICAL_MARKER_RATE_HIT = 0.008  # 0.8% от слов
+
+
+# Дефолтный встроенный список — fallback на случай, если внешний JSON
+# не передан. Намеренно короткий: для серьёзного анализа лучше передать
+# свой список через --cliches PATH.
+DEFAULT_CLICHES = [
     "его сердце сжалось от боли",
     "по спине пробежал холодок",
-    "она почувствовала, как внутри всё похолодело",
     "слёзы навернулись на глаза",
     "к горлу подступил комок",
-    "в груди разлилось тепло",
-    "его охватило странное чувство",
-    "она ощутила лёгкое беспокойство",
-    "смутная тревога не отпускала",
-    "сердце забилось чаще",
-    # описания тишины и атмосферы
     "тишина была оглушительной",
-    "повисла напряжённая тишина",
-    "воздух казался густым от напряжения",
     "время словно остановилось",
-    "мгновение тянулось целую вечность",
-    # взгляды
     "их взгляды встретились",
-    "она посмотрела ему прямо в глаза",
-    "его глаза были полны печали",
-    "в его глазах читалась решимость",
-    "она не могла оторвать от него взгляд",
-    # дыхание и движение
     "он сделал глубокий вдох",
-    "она задержала дыхание",
-    "его рука дрогнула",
-    "он крепко сжал кулаки",
-    "она нервно поправила волосы",
-    # понимание и осознание
-    "она поняла, что больше не может",
-    "он осознал глубину своих чувств",
-    "до неё дошло, что всё изменилось",
-    "ей вдруг стало ясно",
-    # описания природы и обстановки
-    "солнце мягко светило сквозь листву",
-    "ветер ласково играл с её волосами",
+    "она крепко сжала кулаки",
     "лунный свет заливал комнату",
-    "капли дождя барабанили по стеклу",
+    "вдруг", "внезапно", "безусловно", "конечно",
 ]
 
-# Ленивый кэш эмбеддингов для CLICHE_PHRASES — считаются один раз.
+
+def _normalize_cliche_phrase(raw: str) -> str:
+    """Убирает скобочные пометки опционального субъекта.
+    «(взгляд) похож на лезвие» → «взгляд похож на лезвие»
+    «(голос) ровный, как сталь» → «голос ровный, как сталь»
+
+    Обоснование: в исходном списке скобки помечают подразумеваемый
+    субъект, но для эмбеддинга нужно естественное предложение
+    без служебной разметки."""
+    # Просто снимаем парные скобки целиком
+    cleaned = re.sub(r'[()]', '', raw).strip()
+    # Сворачиваем двойные пробелы
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned
+
+
+def load_cliches_from_json(path: str) -> tuple[list[str], list[str]]:
+    """Загружает список клише из JSON и разделяет его на:
+      - лексические маркеры (одиночные слова)
+      - семантические клише (2+ слова, нормализованные)
+
+    Поддерживаемые форматы JSON:
+      - {"bad_style_examples": [...]}
+      - {"cliches": [...]}
+      - просто [...] на верхнем уровне
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        # Берём первый список, который найдём
+        for key in ("bad_style_examples", "cliches", "phrases", "items"):
+            if key in data and isinstance(data[key], list):
+                raw_list = data[key]
+                break
+        else:
+            # Fallback: первое же значение, если оно список
+            for v in data.values():
+                if isinstance(v, list):
+                    raw_list = v
+                    break
+            else:
+                raise ValueError(f"В {path} не нашёл списка клише")
+    elif isinstance(data, list):
+        raw_list = data
+    else:
+        raise ValueError(f"Неожиданный формат {path}")
+
+    lexical = []
+    semantic = []
+    seen_lex = set()
+    seen_sem = set()
+    for raw in raw_list:
+        if not isinstance(raw, str):
+            continue
+        normalized = _normalize_cliche_phrase(raw)
+        if not normalized:
+            continue
+        words = normalized.split()
+        if len(words) == 1:
+            w = words[0].lower()
+            if w not in seen_lex:
+                lexical.append(w)
+                seen_lex.add(w)
+        else:
+            if normalized not in seen_sem:
+                semantic.append(normalized)
+                seen_sem.add(normalized)
+    return lexical, semantic
+
+
+# Глобальные списки клише — могут быть переопределены через --cliches
+# при запуске. Дефолт — из DEFAULT_CLICHES.
+LEXICAL_MARKERS: list[str] = []
+SEMANTIC_CLICHES: list[str] = []
+
+
+def _init_cliches_from_default():
+    """Инициализирует LEXICAL_MARKERS и SEMANTIC_CLICHES из дефолтного
+    списка, если они ещё не были загружены."""
+    global LEXICAL_MARKERS, SEMANTIC_CLICHES
+    if LEXICAL_MARKERS or SEMANTIC_CLICHES:
+        return
+    for raw in DEFAULT_CLICHES:
+        normalized = _normalize_cliche_phrase(raw)
+        if not normalized:
+            continue
+        words = normalized.split()
+        if len(words) == 1:
+            LEXICAL_MARKERS.append(words[0].lower())
+        else:
+            SEMANTIC_CLICHES.append(normalized)
+
+
+def set_cliches(lexical: list[str], semantic: list[str]):
+    """Заменяет глобальные списки и сбрасывает кэш эмбеддингов."""
+    global LEXICAL_MARKERS, SEMANTIC_CLICHES
+    LEXICAL_MARKERS = lexical
+    SEMANTIC_CLICHES = semantic
+    _CLICHE_EMBEDS_CACHE["embs"] = None
+
+
+# Ленивый кэш эмбеддингов для семантических клише — считаются один раз.
 _CLICHE_EMBEDS_CACHE = {"embs": None}
 
 
 def _get_cliche_embeddings():
     """Возвращает np.ndarray (n_cliches, dim) с нормированными
-    эмбеддингами клише или None, если энкодер недоступен."""
+    эмбеддингами семантических клише или None, если энкодер недоступен."""
     if _CLICHE_EMBEDS_CACHE["embs"] is not None:
         return _CLICHE_EMBEDS_CACHE["embs"]
-    embs = encode_sentences(CLICHE_PHRASES)
+    _init_cliches_from_default()
+    if not SEMANTIC_CLICHES:
+        return None
+    embs = encode_sentences(SEMANTIC_CLICHES)
     if embs is not None:
         _CLICHE_EMBEDS_CACHE["embs"] = embs
     return embs
+
+
+def feature_lexical_marker_rate(text: str) -> tuple[float, list[tuple[int, int, str]]]:
+    """Доля слов-маркеров от общего числа слов в тексте + позиции
+    каждого употребления (для подсветки).
+
+    Возвращает (rate, occurrences), где occurrences — список
+    (start, end, marker_word).
+    """
+    _init_cliches_from_default()
+    if not LEXICAL_MARKERS:
+        return 0.0, []
+
+    # Все слова текста с offset'ами
+    word_matches = list(re.finditer(r'[А-Яа-яЁёA-Za-z]+', text))
+    total_words = len(word_matches)
+    if total_words == 0:
+        return 0.0, []
+
+    marker_set = set(LEXICAL_MARKERS)
+    occurrences = []
+    for m in word_matches:
+        if m.group().lower() in marker_set:
+            occurrences.append((m.start(), m.end(), m.group()))
+
+    rate = len(occurrences) / total_words
+    return rate, occurrences
 
 
 def _split_sentences_for_sem(text: str) -> list[tuple[str, int, int]]:
@@ -399,7 +532,7 @@ def find_cliche_matches(sentences_with_offsets: list[tuple[str, int, int]],
         if best_sim >= threshold:
             matches.append({
                 "sentence": sent,
-                "cliche": CLICHE_PHRASES[best_j],
+                "cliche": SEMANTIC_CLICHES[best_j],
                 "similarity": best_sim,
                 "start": s_off,
                 "end": e_off,
@@ -486,6 +619,10 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
     cv_sent_len = feature_cv_sent_len(text)
     punct_entropy = feature_punct_entropy(text)
 
+    # ─── Лексические маркеры (одиночные слова из списка клише) ───
+    # Эта фича не требует энкодера — просто частотный счётчик.
+    lex_rate, lex_occurrences = feature_lexical_marker_rate(text)
+
     # ─── Семантические фичи (если энкодер доступен) ───
     sem_tail_ratio = 0.0
     sem_self_repeat = 0.0
@@ -514,6 +651,7 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
         "repeat_3gram": repeat_3gram,
         "cv_sent_len": cv_sent_len,
         "punct_entropy": punct_entropy,
+        "lexical_marker_rate": lex_rate,
         "sem_tail_ratio": sem_tail_ratio,
         "sem_self_repeat": sem_self_repeat,
         "cliche_proximity": cliche_proximity,
@@ -551,6 +689,7 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
         # и их эмбеддинги (если посчитались).
         result["sent_offsets"] = sent_offsets
         result["sent_embs"] = chunk_sent_embs  # np.ndarray или None
+        result["lex_occurrences"] = lex_occurrences  # для подсветки слов-маркеров
 
     return result
 
@@ -878,11 +1017,12 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
             print("  Готово.\n")
 
     # ─── Подготовка фич ───
-    # Базовые семь признаков всегда:
+    # Базовые признаки (не требуют эмбеддера):
     base_features = [
         "log_std_nll", "log_mean_nll",
         "tail_ratio", "cv_nll",
         "repeat_3gram", "cv_sent_len", "punct_entropy",
+        "lexical_marker_rate",
     ]
     # Семантические — только если энкодер доступен
     sem_features = (
@@ -929,6 +1069,10 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
 
     qs = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 
+    # Гарантированно инициализируем дефолтный список, если внешний не задан,
+    # чтобы записать что-то вменяемое в калибровку.
+    _init_cliches_from_default()
+
     calib = {
         "name": name,
         "model": MODEL_NAME,
@@ -936,6 +1080,10 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
         "semantic_enabled": sem_available,
         "semantic_model": SEM_MODEL_NAME if sem_available else None,
         "embeds_file": CALIBRATION_EMBEDS_FILE if sem_available else None,
+        # Сохраняем сам список клише, чтобы analyze применял ту же
+        # лексическую разметку, с которой калибровка обучалась.
+        "lexical_markers": list(LEXICAL_MARKERS),
+        "semantic_cliches": list(SEMANTIC_CLICHES),
         "standardize_means": means,
         "standardize_stds": stds,
         "logreg_weights": weights,
@@ -1387,6 +1535,43 @@ def diagnose_chunk(stats: dict, chunk_text: str, calib: dict,
             "highlights": [],
         })
 
+    # ─── 9. Лексические маркеры (одиночные слова из списка клише) ───
+    lex_rate = stats.get("lexical_marker_rate", 0.0)
+    lex_occurrences = stats.get("lex_occurrences") or []
+    if lex_rate >= LEXICAL_MARKER_RATE_HIT and lex_occurrences:
+        severity = ("сильно" if lex_rate >= 0.020 else
+                    "умеренно" if lex_rate >= 0.013 else "слабо")
+        # Группируем по слову, чтобы показать частоту каждого
+        word_counts = {}
+        for s_off, e_off, word in lex_occurrences:
+            key = word.lower()
+            word_counts[key] = word_counts.get(key, 0) + 1
+        # Топ-5 самых частых
+        top_words = sorted(word_counts.items(), key=lambda x: -x[1])[:5]
+        words_summary = ", ".join(
+            f"«{w}»×{c}" if c > 1 else f"«{w}»"
+            for w, c in top_words
+        )
+        diags.append({
+            "id": "lexical_markers",
+            "category": "лексика",
+            "severity": severity,
+            "what": (f"Высокая плотность слов-маркеров "
+                      f"({len(lex_occurrences)} употреблений, {lex_rate:.1%} "
+                      f"от слов): {words_summary}."),
+            "why": ("Эти слова — типичные «костыли» нейросетевой прозы: "
+                     "«вдруг», «казалось», «безусловно», «конечно». В живом "
+                     "тексте они встречаются, но не на каждом шагу. "
+                     "Высокая плотность сигнализирует о служебном, "
+                     "«объясняющем» письме."),
+            "advice": ("Уберите 2/3 этих слов — большинство из них «воздух», "
+                        "не несущий смысла. «Вдруг он понял» = «он понял». "
+                        "«Казалось, она устала» = «она устала». Если действие "
+                        "действительно внезапное — пусть это будет видно из "
+                        "ритма, а не из слова «вдруг»."),
+            "highlights": [(s, e) for s, e, _ in lex_occurrences],
+        })
+
     # Сортируем по severity
     severity_order = {"сильно": 0, "умеренно": 1, "слабо": 2}
     diags.sort(key=lambda d: severity_order.get(d["severity"], 3))
@@ -1468,6 +1653,7 @@ def summarize_diagnostics(per_chunk_diags: list[list[dict]]) -> list[str]:
                 "low_diversity": "Бедный лексикон / повторы",
                 "cliche_match": "Семантические клише",
                 "sem_self_repeat": "Повтор одной мысли разными словами",
+                "lexical_markers": "Слова-маркеры («вдруг», «казалось»…)",
             }
             titles[d["id"]] = short.get(d["id"], d["id"])
 
@@ -1625,6 +1811,21 @@ def analyze(text_path: str, verbose: bool = False):
         print(f"Семантические фичи: ВКЛ ({calib.get('semantic_model', '?')})")
     else:
         print("Семантические фичи: ВЫКЛ")
+
+    # Если в калибровке сохранены списки клише, и пользователь не
+    # переопределил их через --cliches — используем те же списки, что
+    # были при калибровке.  Это важно: lexical_marker_rate и
+    # cliche_proximity должны считаться по тому же словарю, иначе
+    # стандартизация дрейфует.
+    if not LEXICAL_MARKERS and not SEMANTIC_CLICHES:
+        # Глобальные списки пусты => --cliches не передавался
+        cal_lex = calib.get("lexical_markers")
+        cal_sem = calib.get("semantic_cliches")
+        if cal_lex is not None or cal_sem is not None:
+            set_cliches(cal_lex or [], cal_sem or [])
+            print(f"Клише восстановлены из калибровки: "
+                  f"{len(cal_lex or [])} лексических, "
+                  f"{len(cal_sem or [])} семантических")
     print()
 
     model, tokenizer, device = load_model()
@@ -1817,13 +2018,33 @@ def main():
     p_cal.add_argument("ai_dir", help="Папка с ИИ-генерированными .txt")
     p_cal.add_argument("--name", default="default",
                        help="Имя калибровки (для версионирования)")
+    p_cal.add_argument("--cliches", default=None,
+                       help="Путь к JSON-списку клише (см. формат в начале файла). "
+                            "Если не задан, используется встроенный мини-список.")
 
     p_an = sub.add_parser("analyze", help="Анализировать текст")
     p_an.add_argument("text_path", help="Путь к .txt для анализа")
     p_an.add_argument("--verbose", "-v", action="store_true",
                        help="Показать гистограммы распределений")
+    p_an.add_argument("--cliches", default=None,
+                       help="Путь к JSON-списку клише.  ВАЖНО: при анализе "
+                            "лучше использовать тот же список, что и при "
+                            "калибровке — иначе lexical_marker_rate будет "
+                            "несовместима со стандартизацией.")
 
     args = parser.parse_args()
+
+    # Загружаем клише, если указан внешний JSON
+    if args.cliches:
+        try:
+            lex, sem = load_cliches_from_json(args.cliches)
+            set_cliches(lex, sem)
+            print(f"Загружено клише из {args.cliches}: "
+                  f"{len(lex)} лексических маркеров, "
+                  f"{len(sem)} семантических фраз\n")
+        except Exception as e:
+            print(f"⚠️  Не удалось загрузить клише из {args.cliches}: {e}")
+            print("    Использую встроенный список.\n")
 
     if args.cmd == "calibrate":
         calibrate(args.human_dir, args.ai_dir, args.name)
