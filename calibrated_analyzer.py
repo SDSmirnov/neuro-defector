@@ -31,6 +31,24 @@
   # Шаг 3: анализировать любой текст с этой калибровкой
   python calibrated_analyzer.py analyze AK.txt
   python calibrated_analyzer.py analyze AK.txt --verbose
+
+Семантические фичи (опционально, требуется sentence-transformers и numpy):
+
+  Если установлены sentence-transformers и numpy, при калибровке
+  дополнительно строятся индексы предложений двух корпусов и
+  считаются три семантические фичи:
+
+    sem_tail_ratio   — kNN-расстояние до человеческого корпуса минус
+                       до ИИ-корпуса; семантический аналог log_mean_nll.
+    sem_self_repeat  — повторяемость идей внутри чанка (max self-cosine).
+    cliche_proximity — близость предложений к встроенному списку клише.
+
+  Эмбеддинги корпусов сохраняются в calibration_embeds.npz рядом с JSON.
+  Если зависимости не установлены, всё продолжает работать на 7 базовых
+  фичах — старые калибровки тоже остаются совместимыми.
+
+  Установка:
+    pip install sentence-transformers numpy
 """
 
 import sys
@@ -43,14 +61,76 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_NAME = "google/gemma-3-270m" # "sberbank-ai/rugpt3small_based_on_gpt2"
+MODEL_NAME = "google/gemma-3-270m" # "sberbank-ai/rugpt3small_based_on_gpt2" # "ai-forever/mGPT" #    #
 TARGET_CHUNK_SIZE = 1000
 MIN_CHUNK_SIZE = 800       # поднято с 600 — на коротких чанках PPL слишком шумная
 MAX_CHUNK_SIZE = 1400
 CALIBRATION_FILE = "calibration.json"
+CALIBRATION_EMBEDS_FILE = "calibration_embeds.npz"
 
 # Малая константа для логарифмов
 EPS = 1e-6
+
+# ─────────────────────── семантический энкодер ───────────────────────
+
+# Sentence-encoder для семантических фич. Lazy-loading: подгружается
+# только при первом обращении.  Если sentence-transformers/numpy не
+# установлены, скрипт продолжает работать на базовых фичах.
+SEM_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+SEM_KNN_K = 5  # сколько ближайших соседей усреднять для устойчивости
+
+_SEM_CACHE = {"available": None, "model": None, "np": None, "error": None}
+
+
+def _try_import_semantic():
+    """Пытается импортировать numpy и sentence-transformers.
+    Кэширует результат — повторные вызовы бесплатны."""
+    if _SEM_CACHE["available"] is not None:
+        return _SEM_CACHE["available"]
+    try:
+        import numpy as np  # noqa: F401
+        from sentence_transformers import SentenceTransformer  # noqa: F401
+        _SEM_CACHE["np"] = np
+        _SEM_CACHE["available"] = True
+    except ImportError as e:
+        _SEM_CACHE["available"] = False
+        _SEM_CACHE["error"] = str(e)
+    return _SEM_CACHE["available"]
+
+
+def _get_sem_model():
+    """Возвращает загруженную sentence-transformer модель.
+    Загружает при первом обращении.  Возвращает None, если модуль
+    недоступен или модель не удалось скачать."""
+    if not _try_import_semantic():
+        return None
+    if _SEM_CACHE["model"] is not None:
+        return _SEM_CACHE["model"]
+    try:
+        from sentence_transformers import SentenceTransformer
+        print(f"Загружаю semantic encoder {SEM_MODEL_NAME}…")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(SEM_MODEL_NAME, device=device)
+        _SEM_CACHE["model"] = model
+        return model
+    except Exception as e:
+        _SEM_CACHE["error"] = f"Не удалось загрузить semantic encoder: {e}"
+        _SEM_CACHE["available"] = False
+        return None
+
+
+def encode_sentences(sentences: list[str]):
+    """Возвращает np.ndarray (n, dim) нормированных эмбеддингов
+    или None, если энкодер недоступен."""
+    if not sentences:
+        return None
+    model = _get_sem_model()
+    if model is None:
+        return None
+    np = _SEM_CACHE["np"]
+    embs = model.encode(sentences, normalize_embeddings=True,
+                        show_progress_bar=False, convert_to_numpy=True)
+    return embs.astype(np.float32)
 
 
 # ─────────────────────── дополнительные фичи ───────────────────────
@@ -136,6 +216,199 @@ def feature_punct_entropy(text: str) -> float:
     return entropy
 
 
+# ─────────────────────── семантические клише ───────────────────────
+
+# Встроенный список типичных ИИ-конструкций для русской прозы.
+# Каждое выражение берётся как самостоятельная мысль; эмбеддятся один
+# раз при первом анализе и сравниваются по косинусу с предложениями
+# текста.  Список можно расширять — это обычные строки, не регулярки.
+#
+# Порог CLICHE_SIM_HIT — выше него считаем, что предложение
+# семантически рифмуется с клише.  Подобран эмпирически для
+# paraphrase-multilingual-MiniLM-L12-v2; при смене энкодера может
+# потребоваться корректировка.
+CLICHE_SIM_HIT = 0.62
+
+CLICHE_PHRASES = [
+    # эмоциональные штампы
+    "его сердце сжалось от боли",
+    "по спине пробежал холодок",
+    "она почувствовала, как внутри всё похолодело",
+    "слёзы навернулись на глаза",
+    "к горлу подступил комок",
+    "в груди разлилось тепло",
+    "его охватило странное чувство",
+    "она ощутила лёгкое беспокойство",
+    "смутная тревога не отпускала",
+    "сердце забилось чаще",
+    # описания тишины и атмосферы
+    "тишина была оглушительной",
+    "повисла напряжённая тишина",
+    "воздух казался густым от напряжения",
+    "время словно остановилось",
+    "мгновение тянулось целую вечность",
+    # взгляды
+    "их взгляды встретились",
+    "она посмотрела ему прямо в глаза",
+    "его глаза были полны печали",
+    "в его глазах читалась решимость",
+    "она не могла оторвать от него взгляд",
+    # дыхание и движение
+    "он сделал глубокий вдох",
+    "она задержала дыхание",
+    "его рука дрогнула",
+    "он крепко сжал кулаки",
+    "она нервно поправила волосы",
+    # понимание и осознание
+    "она поняла, что больше не может",
+    "он осознал глубину своих чувств",
+    "до неё дошло, что всё изменилось",
+    "ей вдруг стало ясно",
+    # описания природы и обстановки
+    "солнце мягко светило сквозь листву",
+    "ветер ласково играл с её волосами",
+    "лунный свет заливал комнату",
+    "капли дождя барабанили по стеклу",
+]
+
+# Ленивый кэш эмбеддингов для CLICHE_PHRASES — считаются один раз.
+_CLICHE_EMBEDS_CACHE = {"embs": None}
+
+
+def _get_cliche_embeddings():
+    """Возвращает np.ndarray (n_cliches, dim) с нормированными
+    эмбеддингами клише или None, если энкодер недоступен."""
+    if _CLICHE_EMBEDS_CACHE["embs"] is not None:
+        return _CLICHE_EMBEDS_CACHE["embs"]
+    embs = encode_sentences(CLICHE_PHRASES)
+    if embs is not None:
+        _CLICHE_EMBEDS_CACHE["embs"] = embs
+    return embs
+
+
+def _split_sentences_for_sem(text: str) -> list[tuple[str, int, int]]:
+    """Разбивает текст на предложения, возвращая тройки
+    (предложение, start_offset, end_offset).  Offsets нужны для
+    подсветки в diagnose_chunk."""
+    out = []
+    cursor = 0
+    for m in re.finditer(r'[^.!?…]+[.!?…]+', text):
+        s, e = m.start(), m.end()
+        sent = text[s:e].strip()
+        if sent and len(sent) > 5:
+            out.append((sent, s, e))
+        cursor = e
+    # Хвост без терминатора
+    if cursor < len(text):
+        tail = text[cursor:].strip()
+        if tail and len(tail) > 5:
+            out.append((tail, cursor, len(text)))
+    return out
+
+
+def feature_sem_tail_ratio(chunk_sent_embs, calib_embeds: dict | None) -> float:
+    """Семантический аналог tail_ratio.  Для каждого предложения чанка
+    считает среднее косинусное расстояние до K ближайших соседей в
+    человеческом корпусе минус то же для ИИ-корпуса.  Усредняется по
+    предложениям.  Положительное значение → текст семантически ближе
+    к человеческому корпусу.
+
+    Эмбеддинги нормированы, поэтому расстояние = 1 - cosine_similarity.
+
+    Возвращает 0.0, если индексы недоступны."""
+    if chunk_sent_embs is None or calib_embeds is None:
+        return 0.0
+    H = calib_embeds.get("human")
+    A = calib_embeds.get("ai")
+    if H is None or A is None or len(H) == 0 or len(A) == 0:
+        return 0.0
+    np = _SEM_CACHE["np"]
+    if np is None:
+        return 0.0
+
+    # косинусные близости (эмбеддинги нормированы)
+    sim_h = chunk_sent_embs @ H.T  # (n_sent, n_human)
+    sim_a = chunk_sent_embs @ A.T
+
+    k = min(SEM_KNN_K, sim_h.shape[1], sim_a.shape[1])
+    # топ-k ближайших — наибольшие cos similarity = наименьшие расстояния
+    top_h = np.partition(sim_h, -k, axis=1)[:, -k:].mean(axis=1)
+    top_a = np.partition(sim_a, -k, axis=1)[:, -k:].mean(axis=1)
+
+    # Чем выше близость к человеческому корпусу относительно ИИ —
+    # тем «человечнее» предложение.
+    score = (top_h - top_a).mean()
+    return float(score)
+
+
+def feature_sem_self_repeat(chunk_sent_embs) -> float:
+    """Повторяемость идей внутри чанка.  Для каждого предложения
+    находит максимальную косинусную близость к остальным предложениям
+    того же чанка и усредняет.  Высокое значение = чанк крутится
+    вокруг одной мысли, переформулированной разными словами."""
+    if chunk_sent_embs is None or len(chunk_sent_embs) < 3:
+        return 0.0
+    np = _SEM_CACHE["np"]
+    if np is None:
+        return 0.0
+
+    sim = chunk_sent_embs @ chunk_sent_embs.T
+    # Зануляем диагональ (самосходство = 1)
+    np.fill_diagonal(sim, -1.0)
+    max_sim_per_sent = sim.max(axis=1)
+    return float(max_sim_per_sent.mean())
+
+
+def feature_cliche_proximity(chunk_sent_embs) -> float:
+    """Близость предложений чанка к каноническому списку клише.
+    Для каждого предложения — максимум косинуса по всем клише.
+    Усредняется по предложениям.  Высокое значение = в чанке много
+    фраз, семантически рифмующихся с типовыми ИИ-формулировками."""
+    if chunk_sent_embs is None or len(chunk_sent_embs) == 0:
+        return 0.0
+    cliche_embs = _get_cliche_embeddings()
+    if cliche_embs is None:
+        return 0.0
+    np = _SEM_CACHE["np"]
+    sim = chunk_sent_embs @ cliche_embs.T  # (n_sent, n_cliches)
+    max_per_sent = sim.max(axis=1)
+    return float(max_per_sent.mean())
+
+
+def find_cliche_matches(sentences_with_offsets: list[tuple[str, int, int]],
+                         chunk_sent_embs,
+                         threshold: float = CLICHE_SIM_HIT) -> list[dict]:
+    """Возвращает список найденных клише-сходств:
+      [{"sentence": ..., "cliche": ..., "similarity": 0.71,
+        "start": 0, "end": 42}, ...]
+    Используется в diagnose_chunk для подсветки конкретных фраз."""
+    if chunk_sent_embs is None or not sentences_with_offsets:
+        return []
+    cliche_embs = _get_cliche_embeddings()
+    if cliche_embs is None:
+        return []
+    np = _SEM_CACHE["np"]
+
+    sim = chunk_sent_embs @ cliche_embs.T  # (n_sent, n_cliches)
+    matches = []
+    for i, (sent, s_off, e_off) in enumerate(sentences_with_offsets):
+        if i >= sim.shape[0]:
+            break
+        best_j = int(np.argmax(sim[i]))
+        best_sim = float(sim[i, best_j])
+        if best_sim >= threshold:
+            matches.append({
+                "sentence": sent,
+                "cliche": CLICHE_PHRASES[best_j],
+                "similarity": best_sim,
+                "start": s_off,
+                "end": e_off,
+            })
+    # Сортируем по убыванию близости — самые «клишированные» сверху
+    matches.sort(key=lambda m: -m["similarity"])
+    return matches
+
+
 # ─────────────────────── общая инфраструктура ───────────────────────
 
 def split_into_chunks(text: str) -> list[str]:
@@ -162,13 +435,21 @@ def split_into_chunks(text: str) -> list[str]:
 
 def compute_chunk_stats(text: str, model, tokenizer, device,
                          max_length: int = 2048,
-                         keep_tokens: bool = False) -> dict | None:
+                         keep_tokens: bool = False,
+                         calib_embeds: dict | None = None,
+                         use_semantic: bool = True) -> dict | None:
     """
     Считает статистики по чанку.
 
     keep_tokens=True — дополнительно возвращает сырые token_nll и
     декодированные токены для диагностики.  В режиме калибровки этого
     не нужно (только финальные статистики), при анализе включается.
+
+    calib_embeds — dict с ключами "human", "ai" (np.ndarray эмбеддингов
+    калибровочных предложений).  Если задан, считается sem_tail_ratio.
+
+    use_semantic — если False, семантические фичи пропускаются (используется
+    при первом проходе калибровки до построения индекса).
     """
     encodings = tokenizer(text, return_tensors="pt", truncation=True,
                           max_length=max_length)
@@ -205,6 +486,24 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
     cv_sent_len = feature_cv_sent_len(text)
     punct_entropy = feature_punct_entropy(text)
 
+    # ─── Семантические фичи (если энкодер доступен) ───
+    sem_tail_ratio = 0.0
+    sem_self_repeat = 0.0
+    cliche_proximity = 0.0
+    sent_offsets = []  # для подсветки в diagnose_chunk
+    chunk_sent_embs = None
+
+    if use_semantic and _try_import_semantic():
+        sentences_with_offsets = _split_sentences_for_sem(text)
+        if len(sentences_with_offsets) >= 2:
+            sentences_only = [s[0] for s in sentences_with_offsets]
+            chunk_sent_embs = encode_sentences(sentences_only)
+            if chunk_sent_embs is not None:
+                sem_tail_ratio = feature_sem_tail_ratio(chunk_sent_embs, calib_embeds)
+                sem_self_repeat = feature_sem_self_repeat(chunk_sent_embs)
+                cliche_proximity = feature_cliche_proximity(chunk_sent_embs)
+                sent_offsets = sentences_with_offsets
+
     result = {
         "mean_nll": mean_nll,
         "std_nll": std_nll,
@@ -215,6 +514,9 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
         "repeat_3gram": repeat_3gram,
         "cv_sent_len": cv_sent_len,
         "punct_entropy": punct_entropy,
+        "sem_tail_ratio": sem_tail_ratio,
+        "sem_self_repeat": sem_self_repeat,
+        "cliche_proximity": cliche_proximity,
         "n_tokens": int(token_nll.shape[0]),
         "truncated": truncated,
     }
@@ -244,6 +546,11 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
             # (rugpt3small использует медленный токенизатор без offsets).
             # Сделаем приближённое сопоставление через декодирование.
             result["token_offsets"] = _approximate_offsets(text, token_strs)
+
+        # Для диагностики клише: сохраним предложения с offset'ами
+        # и их эмбеддинги (если посчитались).
+        result["sent_offsets"] = sent_offsets
+        result["sent_embs"] = chunk_sent_embs  # np.ndarray или None
 
     return result
 
@@ -281,6 +588,7 @@ def load_model():
         MODEL_NAME,
         dtype=torch.float32,
         low_cpu_mem_usage=True,
+        #use_safetensors=False,
     ).to(device)
     model.eval()
     print(f"Модель загружена, устройство: {device}\n")
@@ -416,7 +724,12 @@ def roc_auc(scores: list[float], labels: list[int]) -> float:
 
 def gather_chunk_stats(folder: Path, model, tokenizer, device) -> tuple[list[dict], list[str]]:
     """Прогоняет все .txt файлы в папке, возвращает плоский список
-    статистик и параллельный список имён файлов (для leave-one-file-out)."""
+    статистик и параллельный список имён файлов (для leave-one-file-out).
+
+    На этом этапе семантические фичи sem_tail_ratio/sem_self_repeat/
+    cliche_proximity считаются предварительно (без индексов корпусов
+    для sem_tail_ratio) — итоговое значение sem_tail_ratio
+    пересчитывается в calibrate(), когда индексы построены."""
     files = sorted(folder.glob("*.txt"))
     if not files:
         print(f"⚠️  В папке {folder} нет .txt файлов")
@@ -431,11 +744,16 @@ def gather_chunk_stats(folder: Path, model, tokenizer, device) -> tuple[list[dic
         for chunk in chunks:
             if len(chunk) < MIN_CHUNK_SIZE:
                 continue
-            stats = compute_chunk_stats(chunk, model, tokenizer, device)
+            # keep_tokens=True нужен, чтобы получить sent_embs/sent_offsets;
+            # они занимают память, но это калибровочный путь и текста немного.
+            stats = compute_chunk_stats(chunk, model, tokenizer, device,
+                                          keep_tokens=True)
             if stats is None:
                 continue
             if stats["truncated"]:
                 n_truncated += 1
+            # Сохраним сам чанк — пригодится при перерасчёте sem_tail_ratio
+            stats["_chunk_text"] = chunk
             all_stats.append(stats)
             all_files.append(f.name)
             n_kept += 1
@@ -446,8 +764,76 @@ def gather_chunk_stats(folder: Path, model, tokenizer, device) -> tuple[list[dic
     return all_stats, all_files
 
 
+def _build_corpus_index(all_stats: list[dict]):
+    """Из набора per-chunk статистик собирает плоскую матрицу
+    эмбеддингов всех предложений + параллельный массив id чанков
+    (нужен для leave-self-out при расчёте sem_tail_ratio внутри
+    собственного класса).  Возвращает (np.ndarray, np.ndarray) или None."""
+    if not _try_import_semantic():
+        return None
+    np = _SEM_CACHE["np"]
+    chunks_embs = []
+    chunks_owner = []
+    for chunk_id, s in enumerate(all_stats):
+        embs = s.get("sent_embs")
+        if embs is None or len(embs) == 0:
+            continue
+        chunks_embs.append(embs)
+        chunks_owner.append(np.full(len(embs), chunk_id, dtype=np.int32))
+    if not chunks_embs:
+        return None
+    embs_matrix = np.concatenate(chunks_embs, axis=0)
+    owner_array = np.concatenate(chunks_owner, axis=0)
+    return embs_matrix, owner_array
+
+
+def _sem_tail_ratio_with_leave_self_out(chunk_embs, chunk_id: int,
+                                          own_index, opp_index) -> float:
+    """sem_tail_ratio с исключением предложений того же чанка из
+    собственного индекса.  own_index/opp_index — кортежи
+    (embs_matrix, owner_array).  Используется только в калибровке."""
+    if chunk_embs is None or own_index is None or opp_index is None:
+        return 0.0
+    np = _SEM_CACHE["np"]
+
+    own_embs, own_owner = own_index
+    opp_embs, _ = opp_index
+
+    # косинусные близости (нормированные эмбеддинги)
+    sim_own = chunk_embs @ own_embs.T  # (n_sent, n_own)
+    sim_opp = chunk_embs @ opp_embs.T
+
+    # Маскируем предложения того же чанка в собственном индексе
+    same_chunk_mask = (own_owner == chunk_id)
+    if same_chunk_mask.any():
+        sim_own[:, same_chunk_mask] = -1.0
+
+    k = min(SEM_KNN_K, sim_own.shape[1], sim_opp.shape[1])
+    if k < 1:
+        return 0.0
+
+    top_own = np.partition(sim_own, -k, axis=1)[:, -k:].mean(axis=1)
+    top_opp = np.partition(sim_opp, -k, axis=1)[:, -k:].mean(axis=1)
+    return float((top_own - top_opp).mean())
+
+
 def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
     model, tokenizer, device = load_model()
+
+    # Проверяем доступность семантического энкодера сразу — чтобы
+    # пользователь увидел сообщение в начале, а не в середине прогона.
+    sem_available = _try_import_semantic()
+    if sem_available:
+        # Прогреваем энкодер: лучше упасть/скачать сейчас, до тяжёлой
+        # работы по NLL, чтобы не терять час впустую.
+        sem_model = _get_sem_model()
+        sem_available = sem_model is not None
+    if not sem_available:
+        print("⚠️  Семантический энкодер недоступен "
+              f"({_SEM_CACHE.get('error', 'sentence-transformers не установлен')}).")
+        print("    Калибровка пройдёт на 7 базовых фичах. Чтобы включить")
+        print("    sem_tail_ratio / sem_self_repeat / cliche_proximity:")
+        print("        pip install sentence-transformers numpy\n")
 
     print("─── Человеческий корпус ───")
     human_stats, human_files = gather_chunk_stats(Path(human_dir), model, tokenizer, device)
@@ -458,19 +844,52 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
         print("Недостаточно данных для калибровки (нужно минимум 10 чанков на класс).")
         sys.exit(1)
 
+    # ─── Семантические индексы и пересчёт sem_tail_ratio ───
+    human_index = None
+    ai_index = None
+    if sem_available:
+        print("─── Построение семантических индексов ───")
+        human_index = _build_corpus_index(human_stats)
+        ai_index = _build_corpus_index(ai_stats)
+        if human_index is None or ai_index is None:
+            print("  ⚠️  Не удалось построить индексы (возможно, в чанках нет "
+                  "пригодных предложений). Семантические фичи отключены.\n")
+            sem_available = False
+        else:
+            n_h_sent = len(human_index[0])
+            n_a_sent = len(ai_index[0])
+            print(f"  Человеческий индекс: {n_h_sent} предложений, "
+                  f"размерность {human_index[0].shape[1]}")
+            print(f"  ИИ индекс: {n_a_sent} предложений\n")
+
+            print("─── Пересчёт sem_tail_ratio с leave-self-out ───")
+            for chunk_id, s in enumerate(human_stats):
+                s["sem_tail_ratio"] = _sem_tail_ratio_with_leave_self_out(
+                    s.get("sent_embs"), chunk_id, human_index, ai_index)
+            for chunk_id, s in enumerate(ai_stats):
+                # Для ИИ-чанка «свой» индекс — ИИ, «чужой» — человеческий.
+                # Знак фичи остаётся «> 0 ⇔ ближе к человеку», поэтому
+                # для ИИ-чанков мы считаем (top_human - top_ai_self_excluded).
+                # Для этого вызываем функцию «наоборот»: own=ai_index,
+                # opp=human_index, и инвертируем знак.
+                s_val = _sem_tail_ratio_with_leave_self_out(
+                    s.get("sent_embs"), chunk_id, ai_index, human_index)
+                s["sem_tail_ratio"] = -s_val
+            print("  Готово.\n")
+
     # ─── Подготовка фич ───
-    # Используем семь признаков:
-    #   - log_std_nll, log_mean_nll — основа (центр и разброс перплексии)
-    #   - tail_ratio — доля «удивительных» токенов
-    #   - cv_nll — нормированный разброс
-    #   - repeat_3gram — повторяемость словесных триграмм
-    #   - cv_sent_len — вариативность длин предложений
-    #   - punct_entropy — разнообразие пунктуации
-    feature_names = [
+    # Базовые семь признаков всегда:
+    base_features = [
         "log_std_nll", "log_mean_nll",
         "tail_ratio", "cv_nll",
         "repeat_3gram", "cv_sent_len", "punct_entropy",
     ]
+    # Семантические — только если энкодер доступен
+    sem_features = (
+        ["sem_tail_ratio", "sem_self_repeat", "cliche_proximity"]
+        if sem_available else []
+    )
+    feature_names = base_features + sem_features
 
     def feats(s):
         return [s[name] for name in feature_names]
@@ -514,6 +933,9 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
         "name": name,
         "model": MODEL_NAME,
         "feature_names": feature_names,
+        "semantic_enabled": sem_available,
+        "semantic_model": SEM_MODEL_NAME if sem_available else None,
+        "embeds_file": CALIBRATION_EMBEDS_FILE if sem_available else None,
         "standardize_means": means,
         "standardize_stds": stds,
         "logreg_weights": weights,
@@ -610,6 +1032,20 @@ def calibrate(human_dir: str, ai_dir: str, name: str = "default"):
         json.dumps(calib, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     print(f"\nКалибровка '{name}' сохранена в {CALIBRATION_FILE}")
+
+    # ─── Сохраняем индексы эмбеддингов отдельно (бинарно) ───
+    if sem_available and human_index is not None and ai_index is not None:
+        np = _SEM_CACHE["np"]
+        np.savez_compressed(
+            CALIBRATION_EMBEDS_FILE,
+            human_embs=human_index[0],
+            human_owner=human_index[1],
+            ai_embs=ai_index[0],
+            ai_owner=ai_index[1],
+        )
+        size_mb = Path(CALIBRATION_EMBEDS_FILE).stat().st_size / (1024 * 1024)
+        print(f"Эмбеддинги корпусов сохранены в {CALIBRATION_EMBEDS_FILE} "
+              f"({size_mb:.1f} MB)")
 
 
 # ─────────────────────── анализ ───────────────────────
@@ -882,6 +1318,75 @@ def diagnose_chunk(stats: dict, chunk_text: str, calib: dict,
                 "highlights": [],
             })
 
+    # ─── 7. Семантические клише (если эмбеддинги доступны) ───
+    sent_embs = stats.get("sent_embs")
+    sent_offsets = stats.get("sent_offsets") or []
+    if sent_embs is not None and sent_offsets:
+        matches = find_cliche_matches(sent_offsets, sent_embs)
+        if matches:
+            top = matches[:3]
+            # severity по самому близкому совпадению
+            best_sim = top[0]["similarity"]
+            severity = ("сильно" if best_sim >= 0.78 else
+                        "умеренно" if best_sim >= 0.70 else "слабо")
+            n = len(matches)
+            if n == 1:
+                what_lead = "Найдена 1 фраза, семантически близкая к ИИ-клише"
+            elif 2 <= n <= 4:
+                what_lead = f"Найдены {n} фразы, семантически близкие к ИИ-клише"
+            else:
+                what_lead = f"Найдено {n} фраз, семантически близких к ИИ-клише"
+
+            details_lines = []
+            for m in top:
+                # Усекаем для читаемости
+                sent_short = m["sentence"]
+                if len(sent_short) > 80:
+                    sent_short = sent_short[:77] + "…"
+                details_lines.append(
+                    f'  «{sent_short}» ↔ «{m["cliche"]}» (sim={m["similarity"]:.2f})'
+                )
+
+            highlights = [(m["start"], m["end"]) for m in matches]
+
+            diags.append({
+                "id": "cliche_match",
+                "category": "семантика",
+                "severity": severity,
+                "what": (f"{what_lead}.\n" + "\n".join(details_lines)),
+                "why": ("Эти фразы по смыслу совпадают с типовыми ИИ-конструкциями — "
+                         "даже если слова формально другие, скелет мысли тот же. "
+                         "Модели обучены на огромных корпусах, и определённые "
+                         "способы описать «эмоциональный момент» у них вытоптаны "
+                         "до привычных троп."),
+                "advice": ("Перепишите эти места через конкретное действие или "
+                            "деталь, а не через прямое называние эмоции. Вместо "
+                            "«его сердце сжалось» — что именно он сделал в этот "
+                            "момент: уронил ложку, посмотрел в окно, сказал что-то "
+                            "невпопад. Эмоция должна вычитываться из поведения."),
+                "highlights": highlights,
+            })
+
+    # ─── 8. Семантическая повторяемость (если эмбеддинги доступны) ───
+    sem_self_repeat = stats.get("sem_self_repeat", 0.0)
+    if sent_embs is not None and sem_self_repeat > 0.75:
+        severity = ("сильно" if sem_self_repeat > 0.85 else
+                    "умеренно" if sem_self_repeat > 0.80 else "слабо")
+        diags.append({
+            "id": "sem_self_repeat",
+            "category": "семантика",
+            "severity": severity,
+            "what": (f"Чанк семантически повторяется (self-similarity "
+                      f"={sem_self_repeat:.2f})."),
+            "why": ("Несколько предложений в этом фрагменте выражают одну и ту же "
+                     "мысль разными словами. Это ИИ-привычка: переформулировать "
+                     "только что сказанное, чтобы заполнить объём."),
+            "advice": ("Найдите 2-3 предложения, которые повторяют один тезис, "
+                        "и оставьте одно — самое сильное. Или замените повторы на "
+                        "продвижение действия / новую деталь."),
+            "highlights": [],
+        })
+
     # Сортируем по severity
     severity_order = {"сильно": 0, "умеренно": 1, "слабо": 2}
     diags.sort(key=lambda d: severity_order.get(d["severity"], 3))
@@ -961,6 +1466,8 @@ def summarize_diagnostics(per_chunk_diags: list[list[dict]]) -> list[str]:
                 "few_surprises": "Мало неожиданных слов",
                 "monotone_rhythm": "Монотонные длины предложений",
                 "low_diversity": "Бедный лексикон / повторы",
+                "cliche_match": "Семантические клише",
+                "sem_self_repeat": "Повтор одной мысли разными словами",
             }
             titles[d["id"]] = short.get(d["id"], d["id"])
 
@@ -1079,6 +1586,30 @@ def print_histogram(values: list[float], bins: int = 20, width: int = 40,
         print(f"    {edge:>+6.2f} │{bar} {c}")
 
 
+def _load_calibration_embeds(calib: dict) -> dict | None:
+    """Загружает .npz с эмбеддингами корпусов, если калибровка их
+    использовала.  Возвращает {"human": ndarray, "ai": ndarray} или None."""
+    if not calib.get("semantic_enabled"):
+        return None
+    if not _try_import_semantic():
+        print("⚠️  Калибровка использует семантические фичи, но "
+              "sentence-transformers/numpy не установлены. "
+              "Семантические фичи будут заполнены нулями — "
+              "результат может быть менее точным.")
+        return None
+    embeds_path = calib.get("embeds_file") or CALIBRATION_EMBEDS_FILE
+    if not Path(embeds_path).exists():
+        print(f"⚠️  Файл эмбеддингов {embeds_path} не найден. "
+              "Семантические фичи будут заполнены нулями.")
+        return None
+    np = _SEM_CACHE["np"]
+    data = np.load(embeds_path)
+    return {
+        "human": data["human_embs"],
+        "ai": data["ai_embs"],
+    }
+
+
 def analyze(text_path: str, verbose: bool = False):
     if not Path(CALIBRATION_FILE).exists():
         print(f"Нет файла {CALIBRATION_FILE}. Сначала запустите 'calibrate'.")
@@ -1090,9 +1621,17 @@ def analyze(text_path: str, verbose: bool = False):
           f"{calib['ai']['n_chunks']} ИИ ({calib['ai']['n_files']} файлов)")
     if "auc_loo" in calib:
         print(f"AUC (leave-one-file-out): {calib['auc_loo']:.3f}")
+    if calib.get("semantic_enabled"):
+        print(f"Семантические фичи: ВКЛ ({calib.get('semantic_model', '?')})")
+    else:
+        print("Семантические фичи: ВЫКЛ")
     print()
 
     model, tokenizer, device = load_model()
+
+    # Прогреваем семантический энкодер заранее, если калибровка его требует
+    calib_embeds = _load_calibration_embeds(calib)
+    use_semantic = calib_embeds is not None
 
     text = Path(text_path).read_text(encoding="utf-8")
     chunks = split_into_chunks(text)
@@ -1105,7 +1644,9 @@ def analyze(text_path: str, verbose: bool = False):
             n_skipped_short += 1
             continue
         stats = compute_chunk_stats(chunk, model, tokenizer, device,
-                                     keep_tokens=True)
+                                     keep_tokens=True,
+                                     calib_embeds=calib_embeds,
+                                     use_semantic=use_semantic)
         if stats is None:
             continue
         z, llr, details = humanness_score_logreg(stats, calib)
