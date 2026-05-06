@@ -77,7 +77,7 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_NAME = "google/gemma-3-270m" # "sberbank-ai/rugpt3small_based_on_gpt2" # "ai-forever/mGPT" #    #
+MODEL_NAME =  "ai-forever/mGPT"
 TARGET_CHUNK_SIZE = 1000
 MIN_CHUNK_SIZE = 800       # поднято с 600 — на коротких чанках PPL слишком шумная
 MAX_CHUNK_SIZE = 1400
@@ -92,7 +92,7 @@ EPS = 1e-6
 # Sentence-encoder для семантических фич. Lazy-loading: подгружается
 # только при первом обращении.  Если sentence-transformers/numpy не
 # установлены, скрипт продолжает работать на базовых фичах.
-SEM_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+SEM_MODEL_NAME = "cointegrated/LaBSE-en-ru" # "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 SEM_KNN_K = 5  # сколько ближайших соседей усреднять для устойчивости
 
 _SEM_CACHE = {"available": None, "model": None, "np": None, "error": None}
@@ -2360,7 +2360,7 @@ def analyze(text_path: str, verbose: bool = False, html_path: str | None = None)
                 all_highlights.extend(d.get("highlights", []))
 
             # Текст чанка с подсветкой
-            preview_len = 700
+            preview_len = 7000
             preview = s["chunk"][:preview_len]
             # Корректируем диапазоны под обрезку
             preview_highlights = [(a, min(b, preview_len)) for a, b in all_highlights

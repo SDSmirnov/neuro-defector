@@ -1,4 +1,7 @@
 torch==2.8.0
-transformers==4.56.2
+transformers==5.7.0
+numpy==2.2.6
+sentencepiece==0.2.1
 
-
+# optional: semantic features (sem_tail_ratio, sem_self_repeat, cliche_proximity)
+sentence-transformers==5.4.1
