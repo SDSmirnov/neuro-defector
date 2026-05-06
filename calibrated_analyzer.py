@@ -252,9 +252,28 @@ def feature_punct_entropy(text: str) -> float:
 # потребоваться корректировка.
 CLICHE_SIM_HIT = 0.62
 
+# Минимальная длина предложения для семантического матчинга.
+# Эмбеддинги MiniLM на 1–3-словных репликах шумные — почти всегда ложные срабатывания.
+MIN_CLICHE_SENT_WORDS = 5
+MIN_CLICHE_SENT_CHARS = 25
+
+# Максимум подсвечиваемых клише в одном чанке (остальные учитываются в счёте, но не выделяются).
+MAX_CLICHE_HIGHLIGHTS = 5
+
 # Высокая плотность слов-маркеров считается диагностическим сигналом.
 # Например, 3 «вдруг» на 200 слов = 1.5% — это уже подозрительно много.
 LEXICAL_MARKER_RATE_HIT = 0.008  # 0.8% от слов
+
+# Экспрессивные глаголы речи — отдельная редакторская диагностика.
+# В единственном числе могут быть приёмом; в большой концентрации — маркер мелодрамы/шаблона.
+EXPRESSIVE_SPEECH_VERBS = re.compile(
+    r'\b(прохрипел[аи]?|прорычал[аи]?|прошипел[аи]?|выдохнул[аи]?|процедил[аи]?|'
+    r'рявкнул[аи]?|пробормотал[аи]?|прошептал[аи]?|пробурчал[аи]?|'
+    r'воскликнул[аи]?|выпалил[аи]?|отчеканил[аи]?|прошелестел[аи]?|'
+    r'промычал[аи]?|прошепнул[аи]?|прорыдал[аи]?|проворчал[аи]?|'
+    r'пробасил[аи]?|прогудел[аи]?|прокаркал[аи]?|замямлил[аи]?|засипел[аи]?)\b',
+    re.IGNORECASE,
+)
 
 
 # Дефолтный встроенный список — fallback на случай, если внешний JSON
@@ -372,10 +391,37 @@ def set_cliches(lexical: list[str], semantic: list[str]):
     LEXICAL_MARKERS = lexical
     SEMANTIC_CLICHES = semantic
     _CLICHE_EMBEDS_CACHE["embs"] = None
+    _CLICHE_EMBEDS_CACHE["cluster_ids"] = None
 
 
 # Ленивый кэш эмбеддингов для семантических клише — считаются один раз.
-_CLICHE_EMBEDS_CACHE = {"embs": None}
+_CLICHE_EMBEDS_CACHE: dict = {"embs": None, "cluster_ids": None}
+
+
+def _cluster_cliche_embs(embs, threshold: float = 0.85) -> list[int]:
+    """Greedy union-find кластеризация клише по косинусной близости.
+    Возвращает список cluster_id для каждого клише (< threshold → собственный кластер)."""
+    n = len(embs)
+    np = _SEM_CACHE["np"]
+    if np is None or n == 0:
+        return list(range(n))
+    sim = embs @ embs.T
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if float(sim[i, j]) >= threshold:
+                pi, pj = find(i), find(j)
+                if pi != pj:
+                    parent[max(pi, pj)] = min(pi, pj)
+
+    return [find(i) for i in range(n)]
 
 
 def _get_cliche_embeddings():
@@ -389,6 +435,7 @@ def _get_cliche_embeddings():
     embs = encode_sentences(SEMANTIC_CLICHES)
     if embs is not None:
         _CLICHE_EMBEDS_CACHE["embs"] = embs
+        _CLICHE_EMBEDS_CACHE["cluster_ids"] = _cluster_cliche_embs(embs)
     return embs
 
 
@@ -474,6 +521,25 @@ def feature_sem_tail_ratio(chunk_sent_embs, calib_embeds: dict | None) -> float:
     return float(score)
 
 
+def _compute_sem_tail_per_sent(chunk_sent_embs,
+                                calib_embeds: dict) -> list[float]:
+    """Возвращает per-sentence sem_tail scores (top_h - top_a) для подсветки
+    конкретных предложений. Положительное → ближе к человеку, отрицательное → к ИИ."""
+    H = calib_embeds.get("human")
+    A = calib_embeds.get("ai")
+    if H is None or A is None or len(H) == 0 or len(A) == 0:
+        return []
+    np = _SEM_CACHE["np"]
+    if np is None:
+        return []
+    sim_h = chunk_sent_embs @ H.T
+    sim_a = chunk_sent_embs @ A.T
+    k = min(SEM_KNN_K, sim_h.shape[1], sim_a.shape[1])
+    top_h = np.partition(sim_h, -k, axis=1)[:, -k:].mean(axis=1)
+    top_a = np.partition(sim_a, -k, axis=1)[:, -k:].mean(axis=1)
+    return (top_h - top_a).tolist()
+
+
 def feature_sem_self_repeat(chunk_sent_embs) -> float:
     """Повторяемость идей внутри чанка.  Для каждого предложения
     находит максимальную косинусную близость к остальным предложениям
@@ -514,7 +580,11 @@ def find_cliche_matches(sentences_with_offsets: list[tuple[str, int, int]],
     """Возвращает список найденных клише-сходств:
       [{"sentence": ..., "cliche": ..., "similarity": 0.71,
         "start": 0, "end": 42}, ...]
-    Используется в diagnose_chunk для подсветки конкретных фраз."""
+    Используется в diagnose_chunk для подсветки конкретных фраз.
+
+    Короткие предложения (< MIN_CLICHE_SENT_WORDS слов или < MIN_CLICHE_SENT_CHARS
+    символов) пропускаются — их эмбеддинги слишком шумные.
+    Результат дедуплицируется по кластерам близких клише."""
     if chunk_sent_embs is None or not sentences_with_offsets:
         return []
     cliche_embs = _get_cliche_embeddings()
@@ -527,18 +597,36 @@ def find_cliche_matches(sentences_with_offsets: list[tuple[str, int, int]],
     for i, (sent, s_off, e_off) in enumerate(sentences_with_offsets):
         if i >= sim.shape[0]:
             break
+        # Пропускаем слишком короткие предложения — их эмбеддинг ненадёжен
+        if len(sent) < MIN_CLICHE_SENT_CHARS or len(sent.split()) < MIN_CLICHE_SENT_WORDS:
+            continue
         best_j = int(np.argmax(sim[i]))
         best_sim = float(sim[i, best_j])
         if best_sim >= threshold:
             matches.append({
                 "sentence": sent,
                 "cliche": SEMANTIC_CLICHES[best_j],
+                "cliche_idx": best_j,
                 "similarity": best_sim,
                 "start": s_off,
                 "end": e_off,
             })
     # Сортируем по убыванию близости — самые «клишированные» сверху
     matches.sort(key=lambda m: -m["similarity"])
+
+    # Дедупликация по кластеру клише: если два предложения попали в один
+    # кластер близких клише, оставляем только то, что ближе.
+    cluster_ids = _CLICHE_EMBEDS_CACHE.get("cluster_ids")
+    if cluster_ids:
+        seen_clusters: set[int] = set()
+        deduped = []
+        for m in matches:
+            cid = cluster_ids[m["cliche_idx"]]
+            if cid not in seen_clusters:
+                seen_clusters.add(cid)
+                deduped.append(m)
+        matches = deduped
+
     return matches
 
 
@@ -629,6 +717,7 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
     cliche_proximity = 0.0
     sent_offsets = []  # для подсветки в diagnose_chunk
     chunk_sent_embs = None
+    sem_tail_per_sent: list[float] = []  # per-sentence scores для fine-grained подсветки
 
     if use_semantic and _try_import_semantic():
         sentences_with_offsets = _split_sentences_for_sem(text)
@@ -640,6 +729,8 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
                 sem_self_repeat = feature_sem_self_repeat(chunk_sent_embs)
                 cliche_proximity = feature_cliche_proximity(chunk_sent_embs)
                 sent_offsets = sentences_with_offsets
+                if keep_tokens and calib_embeds is not None:
+                    sem_tail_per_sent = _compute_sem_tail_per_sent(chunk_sent_embs, calib_embeds)
 
     result = {
         "mean_nll": mean_nll,
@@ -690,6 +781,7 @@ def compute_chunk_stats(text: str, model, tokenizer, device,
         result["sent_offsets"] = sent_offsets
         result["sent_embs"] = chunk_sent_embs  # np.ndarray или None
         result["lex_occurrences"] = lex_occurrences  # для подсветки слов-маркеров
+        result["sem_tail_per_sent"] = sem_tail_per_sent  # per-sentence sem_tail
 
     return result
 
@@ -1479,11 +1571,11 @@ def diagnose_chunk(stats: dict, chunk_text: str, calib: dict,
                         "умеренно" if best_sim >= 0.70 else "слабо")
             n = len(matches)
             if n == 1:
-                what_lead = "Найдена 1 фраза, семантически близкая к ИИ-клише"
+                what_lead = "Найдена 1 фраза, рифмующаяся с жанровым штампом"
             elif 2 <= n <= 4:
-                what_lead = f"Найдены {n} фразы, семантически близкие к ИИ-клише"
+                what_lead = f"Найдено {n} фразы, рифмующихся с жанровыми штампами"
             else:
-                what_lead = f"Найдено {n} фраз, семантически близких к ИИ-клише"
+                what_lead = f"Найдено {n} фраз, рифмующихся с жанровыми штампами"
 
             details_lines = []
             for m in top:
@@ -1495,18 +1587,19 @@ def diagnose_chunk(stats: dict, chunk_text: str, calib: dict,
                     f'  «{sent_short}» ↔ «{m["cliche"]}» (sim={m["similarity"]:.2f})'
                 )
 
-            highlights = [(m["start"], m["end"]) for m in matches]
+            # Ограничиваем подсветку топ-N — иначе чанк превращается в кашу
+            highlights = [(m["start"], m["end"]) for m in matches[:MAX_CLICHE_HIGHLIGHTS]]
 
             diags.append({
                 "id": "cliche_match",
                 "category": "семантика",
                 "severity": severity,
                 "what": (f"{what_lead}.\n" + "\n".join(details_lines)),
-                "why": ("Эти фразы по смыслу совпадают с типовыми ИИ-конструкциями — "
-                         "даже если слова формально другие, скелет мысли тот же. "
-                         "Модели обучены на огромных корпусах, и определённые "
-                         "способы описать «эмоциональный момент» у них вытоптаны "
-                         "до привычных троп."),
+                "why": ("Фразы рифмуются с распространёнными образами жанровой прозы. "
+                         "Это не обязательно означает ИИ-генерацию — такие образы "
+                         "встречаются у многих авторов. Редактору стоит решить: "
+                         "работает ли этот образ в данном контексте или воспроизводит "
+                         "шаблон без необходимости."),
                 "advice": ("Перепишите эти места через конкретное действие или "
                             "деталь, а не через прямое называние эмоции. Вместо "
                             "«его сердце сжалось» — что именно он сделал в этот "
@@ -1570,6 +1663,66 @@ def diagnose_chunk(stats: dict, chunk_text: str, calib: dict,
                         "действительно внезапное — пусть это будет видно из "
                         "ритма, а не из слова «вдруг»."),
             "highlights": [(s, e) for s, e, _ in lex_occurrences],
+        })
+
+    # ─── 10. Per-sentence sem_tail (item 6) ───
+    # Подсвечивает конкретные предложения внутри чанка, которые семантически
+    # ближе к ИИ-корпусу, чем к человеческому — даже если нет конкретного клише.
+    sem_tail_per_sent = stats.get("sem_tail_per_sent") or []
+    if (sem_tail_per_sent and sent_offsets
+            and len(sem_tail_per_sent) == len(sent_offsets)
+            and stats.get("sem_tail_ratio", 0.0) < -0.02):
+        indexed_scores = sorted(range(len(sem_tail_per_sent)),
+                                key=lambda i: sem_tail_per_sent[i])
+        worst_idxs = [i for i in indexed_scores[:3] if sem_tail_per_sent[i] < 0.0]
+        if worst_idxs:
+            worst_sents = [sent_offsets[i] for i in worst_idxs]
+            details = "; ".join(
+                f'«{s[:55]}{"…" if len(s) > 55 else ""}»'
+                for s, _, _ in worst_sents
+            )
+            sem_tr = stats.get("sem_tail_ratio", 0.0)
+            severity = "умеренно" if sem_tr < -0.04 else "слабо"
+            diags.append({
+                "id": "sem_tail_sentences",
+                "category": "семантика",
+                "severity": severity,
+                "what": (f"Предложения, семантически наиболее близкие к ИИ-корпусу "
+                          f"({len(worst_idxs)} из {len(sent_offsets)}): {details}."),
+                "why": ("В семантическом пространстве эти предложения ближе к "
+                         "типичным ИИ-текстам, чем к человеческим — даже не "
+                         "попадая под конкретные клише."),
+                "advice": ("Перепишите подсвеченные предложения: добавьте "
+                            "конкретную деталь, нестандартный угол зрения или "
+                            "авторскую лексику, чтобы сдвинуть их из «среднего» "
+                            "семантического пространства."),
+                "highlights": [(s_off, e_off) for _, s_off, e_off in worst_sents],
+            })
+
+    # ─── 11. Экспрессивные глаголы речи (item 3) ───
+    ev_matches = list(EXPRESSIVE_SPEECH_VERBS.finditer(chunk_text))
+    if len(ev_matches) >= 3:
+        n_ev = len(ev_matches)
+        n_sent_local = max(len(sentences), 1)
+        density = n_ev / n_sent_local
+        severity = "сильно" if n_ev >= 5 or density >= 0.4 else "умеренно"
+        verbs_seen = sorted({m.group().lower() for m in ev_matches})
+        verbs_str = ", ".join(f"«{v}»" for v in verbs_seen[:6])
+        diags.append({
+            "id": "expressive_verbs",
+            "category": "стилистика",
+            "severity": severity,
+            "what": (f"Высокая плотность экспрессивных глаголов речи "
+                      f"({n_ev} вхождений): {verbs_str}."),
+            "why": ("Глаголы «прорычал», «выдохнул», «процедил» и подобные "
+                     "создают яркость в единичных случаях, но в большой "
+                     "концентрации дают мелодраматический или пародийный эффект. "
+                     "Это распространённая черта нейросетевой прозы."),
+            "advice": ("Замените часть на нейтральные «сказал», «спросил», «ответил» "
+                        "или уберите атрибуцию диалога вовсе — читатель сам поймёт, "
+                        "кто говорит. Экспрессивный глагол работает только как "
+                        "исключение из правила."),
+            "highlights": [(m.start(), m.end()) for m in ev_matches],
         })
 
     # Сортируем по severity
@@ -1651,9 +1804,11 @@ def summarize_diagnostics(per_chunk_diags: list[list[dict]]) -> list[str]:
                 "few_surprises": "Мало неожиданных слов",
                 "monotone_rhythm": "Монотонные длины предложений",
                 "low_diversity": "Бедный лексикон / повторы",
-                "cliche_match": "Семантические клише",
+                "cliche_match": "Жанровые штампы (семантические)",
                 "sem_self_repeat": "Повтор одной мысли разными словами",
                 "lexical_markers": "Слова-маркеры («вдруг», «казалось»…)",
+                "sem_tail_sentences": "Предложения близко к ИИ-пространству",
+                "expressive_verbs": "Экспрессивные глаголы речи",
             }
             titles[d["id"]] = short.get(d["id"], d["id"])
 
@@ -1796,7 +1951,225 @@ def _load_calibration_embeds(calib: dict) -> dict | None:
     }
 
 
-def analyze(text_path: str, verbose: bool = False):
+def generate_html_report(text_path: str, all_stats: list[dict], calib: dict,
+                          flagged: list[dict], per_chunk_diagnostics: list[list[dict]],
+                          summary: list[str], output_path: str) -> None:
+    """Генерирует самодостаточный HTML-отчёт об анализе текста."""
+    import html as _html
+    from datetime import datetime
+
+    filename = Path(text_path).name
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    mean_z = sum(s["z"] for s in all_stats) / len(all_stats)
+    aggregate_score = math.tanh(mean_z / 2.0)
+
+    def score_color(score: float) -> str:
+        if score < -0.5: return "#e94560"
+        if score < -0.2: return "#f5a623"
+        if score < 0.2:  return "#888888"
+        return "#3d9970"
+
+    def score_css_class(score: float) -> str:
+        if score < -0.5: return "s-ai2"
+        if score < -0.2: return "s-ai1"
+        if score < 0.2:  return "s-neu"
+        return "s-hum"
+
+    def highlight_html(text: str, ranges: list[tuple[int, int]]) -> str:
+        if not ranges:
+            return _html.escape(text)
+        sorted_ranges = sorted((s, e) for s, e in ranges if 0 <= s < e <= len(text))
+        merged: list[tuple[int, int]] = []
+        for s, e in sorted_ranges:
+            if merged and s <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        parts: list[str] = []
+        cursor = 0
+        for s, e in merged:
+            parts.append(_html.escape(text[cursor:s]))
+            parts.append(f'<mark>{_html.escape(text[s:e])}</mark>')
+            cursor = e
+        parts.append(_html.escape(text[cursor:]))
+        return "".join(parts)
+
+    # ── Веса фич ──
+    feature_names = calib.get("feature_names", [])
+    weights = calib.get("logreg_weights", [])
+    weight_rows = ""
+    if feature_names and weights:
+        for w, name in sorted(zip(weights, feature_names), key=lambda x: -abs(x[0])):
+            bar_w = min(int(abs(w) * 60), 120)
+            bar_color = "#3d9970" if w > 0 else "#e94560"
+            direction = "человек" if w > 0 else "ИИ"
+            weight_rows += (
+                f"<tr><td class='fn'>{_html.escape(name)}</td>"
+                f"<td class='fv'>{w:+.3f}</td>"
+                f"<td class='fd'>{direction}</td>"
+                f"<td><div style='width:{bar_w}px;height:10px;"
+                f"background:{bar_color};border-radius:2px'></div></td></tr>\n"
+            )
+
+    # ── Таблица чанков ──
+    chunk_rows = ""
+    for s in all_stats:
+        cls = score_css_class(s["score"])
+        chunk_rows += (
+            f"<tr class='{cls}'>"
+            f"<td>{s['index']}</td><td>{len(s['chunk'])}</td>"
+            f"<td>{s['mean_nll']:.2f}</td><td>{s['std_nll']:.2f}</td>"
+            f"<td>{s['z']:+.2f}</td><td>{s['score']:+.2f}</td>"
+            f"<td>{_html.escape(label_for_score(s['score']))}</td></tr>\n"
+        )
+
+    # ── Подозрительные чанки ──
+    chunks_html = ""
+    sev_colors = {"сильно": "#e94560", "умеренно": "#f5a623", "слабо": "#7a7a9a"}
+    for s, diags in zip(flagged, per_chunk_diagnostics):
+        confidence = (1 - math.exp(-abs(s["z"]))) * 100
+        cls = score_css_class(s["score"])
+
+        all_hl: list[tuple[int, int]] = []
+        for d in diags:
+            all_hl.extend(d.get("highlights", []))
+
+        preview = s["chunk"][:1200]
+        preview_hl = [(a, min(b, 1200)) for a, b in all_hl if a < 1200]
+        text_body = highlight_html(preview, preview_hl)
+        if len(s["chunk"]) > 1200:
+            text_body += "<span class='ell'>…</span>"
+
+        diag_html = ""
+        for d in diags:
+            sc = sev_colors.get(d["severity"], "#888")
+            what_esc = _html.escape(d["what"]).replace("\n", "<br>")
+            diag_html += (
+                f"<div class='diag' style='border-left:3px solid {sc}'>"
+                f"<div class='dw'>[{_html.escape(d['severity'])}] {what_esc}</div>"
+                f"<div class='di'>Почему: {_html.escape(d['why'])}</div>"
+                f"<div class='da'>Совет: {_html.escape(d['advice'])}</div>"
+                f"</div>\n"
+            )
+
+        chunks_html += (
+            f"<div class='cd {cls}'>"
+            f"<div class='ch'>Чанк #{s['index']} &mdash; score {s['score']:+.2f}"
+            f" | уверенность: {confidence:.0f}%</div>"
+            f"{diag_html or '<p>Конкретных локальных маркеров не выявлено.</p>'}"
+            f"<pre class='ct'>{text_body}</pre>"
+            f"</div>\n"
+        )
+
+    # ── Сводка ──
+    summary_html = (
+        "<ul>" + "".join(f"<li>{_html.escape(l)}</li>" for l in summary) + "</ul>"
+        if summary else "<p>Нет данных.</p>"
+    )
+
+    cal_name = _html.escape(calib.get("name", "default"))
+    agg_color = score_color(aggregate_score)
+    auc_str = f"{calib['auc_loo']:.3f}" if "auc_loo" in calib else "N/A"
+    sem_status = "ВКЛ" if calib.get("semantic_enabled") else "ВЫКЛ"
+
+    css = """
+* { box-sizing: border-box; }
+body { font-family: 'Segoe UI', sans-serif; max-width: 1100px; margin: 0 auto;
+       padding: 24px; background: #12121f; color: #d0d0e0; line-height: 1.5; }
+h1 { color: #e94560; margin-bottom: 4px; }
+h2 { color: #a0c4ff; border-bottom: 1px solid #2a2a4a; padding-bottom: 6px; margin-top: 32px; }
+.meta { color: #888; font-size: .85em; margin-bottom: 24px; }
+.sb { background: #1e1e3a; border-radius: 8px; padding: 16px 24px; margin-bottom: 24px;
+      display: flex; gap: 32px; flex-wrap: wrap; }
+.si { text-align: center; }
+.sv { font-size: 2em; font-weight: bold; }
+.sl { font-size: .8em; color: #888; }
+table { width: 100%; border-collapse: collapse; font-size: .9em; }
+th { background: #1e1e3a; color: #a0c4ff; padding: 8px; text-align: left; }
+td { padding: 6px 8px; border-bottom: 1px solid #1a1a30; }
+.s-ai2 { background: rgba(233,69,96,.25); }
+.s-ai1 { background: rgba(245,166,35,.15); }
+.s-neu { background: rgba(100,100,120,.1); }
+.s-hum { background: rgba(61,153,112,.1); }
+.fn { font-family: monospace; }
+.fv { font-family: monospace; text-align: right; padding-right: 12px; }
+.fd { color: #888; font-size: .85em; }
+.cd { border-radius: 8px; padding: 16px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
+.ch { font-weight: bold; font-size: 1.05em; margin-bottom: 12px; }
+.diag { margin: 8px 0; padding: 8px 12px; background: rgba(0,0,0,.2); border-radius: 4px; }
+.dw { font-weight: 600; margin-bottom: 4px; }
+.di, .da { font-size: .88em; color: #aaa; margin: 3px 0; }
+.ct { background: #0d0d1a; border-radius: 6px; padding: 14px; margin-top: 12px;
+      white-space: pre-wrap; font-size: .88em; line-height: 1.7; overflow-x: auto; }
+mark { background: rgba(233,69,96,.35); border-radius: 2px; padding: 0 1px;
+       color: inherit; text-decoration: underline rgba(233,69,96,.7); }
+.ell { color: #555; }
+ul { padding-left: 20px; }
+li { margin: 4px 0; }
+"""
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>NeuroDefector: {_html.escape(filename)}</title>
+<style>{css}</style>
+</head>
+<body>
+<h1>NeuroDefector Report</h1>
+<div class="meta">{_html.escape(filename)} &middot; {date_str} &middot; Калибровка: &laquo;{cal_name}&raquo;</div>
+
+<div class="sb">
+  <div class="si">
+    <div class="sv" style="color:{agg_color}">{aggregate_score:+.2f}</div>
+    <div class="sl">Агрегированный балл</div>
+  </div>
+  <div class="si">
+    <div class="sv" style="font-size:1.2em;color:{agg_color}">{_html.escape(label_for_score(aggregate_score))}</div>
+    <div class="sl">Вердикт</div>
+  </div>
+  <div class="si">
+    <div class="sv">{len(flagged)}/{len(all_stats)}</div>
+    <div class="sl">Подозрительных чанков</div>
+  </div>
+  <div class="si">
+    <div class="sv">{auc_str}</div>
+    <div class="sl">AUC (LOO)</div>
+  </div>
+  <div class="si">
+    <div class="sv" style="font-size:1em">{sem_status}</div>
+    <div class="sl">Семантика</div>
+  </div>
+</div>
+
+<h2>Веса фич</h2>
+<table>
+<tr><th>Фича</th><th>Вес</th><th>Направление</th><th>Величина</th></tr>
+{weight_rows}
+</table>
+
+<h2>Чанки</h2>
+<table>
+<tr><th>#</th><th>симв</th><th>mean_nll</th><th>std_nll</th><th>z</th><th>score</th><th>метка</th></tr>
+{chunk_rows}
+</table>
+
+<h2>Подозрительные чанки ({len(flagged)})</h2>
+{chunks_html or '<p>Подозрительных чанков нет.</p>'}
+
+<h2>Сводка</h2>
+{summary_html}
+
+<p style="color:#444;font-size:.8em;margin-top:40px">Создано NeuroDefector &middot; {date_str}</p>
+</body>
+</html>"""
+
+    Path(output_path).write_text(html_doc, encoding="utf-8")
+    print(f"\nHTML-отчёт сохранён: {output_path}")
+
+
+def analyze(text_path: str, verbose: bool = False, html_path: str | None = None):
     if not Path(CALIBRATION_FILE).exists():
         print(f"Нет файла {CALIBRATION_FILE}. Сначала запустите 'calibrate'.")
         sys.exit(1)
@@ -1812,6 +2185,18 @@ def analyze(text_path: str, verbose: bool = False):
     else:
         print("Семантические фичи: ВЫКЛ")
 
+    # Веса фич — печатаем для интерпретируемости (item 4)
+    feature_names = calib.get("feature_names", [])
+    weights = calib.get("logreg_weights", [])
+    if feature_names and weights:
+        print("\nТоп фичи (вес > 0 → человек, < 0 → ИИ):")
+        paired = sorted(zip(weights, feature_names), key=lambda x: -abs(x[0]))
+        for w, name in paired:
+            bar = ("+" * min(int(abs(w) * 6), 12) if w > 0
+                   else "-" * min(int(abs(w) * 6), 12))
+            direction = "→ человек" if w > 0 else "→ ИИ    "
+            print(f"  {name:<24} {w:+.3f}  {direction}  {bar}")
+
     # Если в калибровке сохранены списки клише, и пользователь не
     # переопределил их через --cliches — используем те же списки, что
     # были при калибровке.  Это важно: lexical_marker_rate и
@@ -1823,7 +2208,7 @@ def analyze(text_path: str, verbose: bool = False):
         cal_sem = calib.get("semantic_cliches")
         if cal_lex is not None or cal_sem is not None:
             set_cliches(cal_lex or [], cal_sem or [])
-            print(f"Клише восстановлены из калибровки: "
+            print(f"\nКлише восстановлены из калибровки: "
                   f"{len(cal_lex or [])} лексических, "
                   f"{len(cal_sem or [])} семантических")
     print()
@@ -1916,6 +2301,7 @@ def analyze(text_path: str, verbose: bool = False):
         print_histogram([s["log_mean_nll"] for s in all_stats], label="анализируемый текст")
 
     # ─── Подробно — самые подозрительные ───
+    per_chunk_diagnostics: list[list[dict]] = []  # для итоговой сводки и HTML
     if flagged:
         # Контекст текста — для относительных сравнений в диагностике
         text_ctx = compute_text_context(all_stats)
@@ -1924,7 +2310,6 @@ def analyze(text_path: str, verbose: bool = False):
         use_color = sys.stdout.isatty()
 
         print(f"\nПодозрительные чанки ({len(flagged)}):")
-        per_chunk_diagnostics = []  # для итоговой сводки
 
         for s in flagged:
             print(f"\n{'═' * 72}")
@@ -2000,7 +2385,12 @@ def analyze(text_path: str, verbose: bool = False):
                 "много флагов."
             )
     else:
+        summary = []
         print("\nПодозрительных чанков нет.")
+
+    if html_path:
+        generate_html_report(text_path, all_stats, calib, flagged,
+                             per_chunk_diagnostics, summary, html_path)
 
 
 # ─────────────────────── CLI ───────────────────────
@@ -2026,6 +2416,8 @@ def main():
     p_an.add_argument("text_path", help="Путь к .txt для анализа")
     p_an.add_argument("--verbose", "-v", action="store_true",
                        help="Показать гистограммы распределений")
+    p_an.add_argument("--html", metavar="PATH", nargs="?", const="report.html",
+                       help="Сохранить HTML-отчёт (по умолчанию report.html)")
     p_an.add_argument("--cliches", default=None,
                        help="Путь к JSON-списку клише.  ВАЖНО: при анализе "
                             "лучше использовать тот же список, что и при "
@@ -2049,7 +2441,8 @@ def main():
     if args.cmd == "calibrate":
         calibrate(args.human_dir, args.ai_dir, args.name)
     elif args.cmd == "analyze":
-        analyze(args.text_path, verbose=args.verbose)
+        analyze(args.text_path, verbose=args.verbose,
+                html_path=getattr(args, "html", None))
 
 
 if __name__ == "__main__":
